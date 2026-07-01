@@ -6,9 +6,14 @@ A python program the mimics the ZeDMD hardware to put a virtual DMD on your PC. 
 
 ## Execute
 
-For MP4 recording support, install the optional video writer dependencies:
+On Debian/Ubuntu Linux, install the Python/Tk image dependencies:
 ```
-python3 -m pip install imageio imageio-ffmpeg
+sudo apt install python3-tk python3-pillow python3-pil.imagetk
+```
+
+For MP4 recording support, install the video writer dependencies:
+```
+sudo apt install python3-imageio python3-imageio-ffmpeg ffmpeg
 ```
 
 Run as root because vpx hits the port 80 first for settings.  To run on 80 you need root.
