@@ -24,7 +24,7 @@ The renderer serves `GET /handshake`, `GET /get_version`, and the fallback width
 By default it binds UDP and TCP to all IPv4 interfaces with `--bind-host 0.0.0.0`.
 The terminal logs TCP connections, HTTP version requests, and the first UDP packets so you can confirm whether VPX is reaching the renderer.
 
-The window includes a `Start MP4` / `Stop MP4` button. Recordings are saved to `recordings/` by default.
+The window includes `Start MP4` and `Stop MP4` buttons. Recordings are saved to `recordings/` by default and capture the displayed DMD at a fixed frame rate so playback timing is preserved.
 
 You can change the output directory or frame rate:
 ```

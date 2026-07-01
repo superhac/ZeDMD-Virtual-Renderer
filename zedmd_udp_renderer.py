@@ -10,6 +10,7 @@ import zlib
 import threading
 import os
 import datetime
+import time
 import tkinter as tk
 from tkinter import messagebox
 from PIL import Image, ImageTk
@@ -84,12 +85,14 @@ class ZeDMDRenderer(tk.Tk):
         self.frameless = frameless
         self.record_dir = record_dir
         self.video_dir = video_dir
-        self.video_fps = video_fps
+        self.video_fps = max(1, video_fps)
         self.settings_port = settings_port
         self.bind_host = bind_host
         self.video_writer = None
         self.video_path = None
         self.video_frame_count = 0
+        self.video_next_frame_time = None
+        self.video_after_id = None
         self._pending_packets = []
         self._frame_counter = 0
         self._udp_packet_count = 0
@@ -326,8 +329,6 @@ class ZeDMDRenderer(tk.Tk):
         except Exception:
             self.image_id = self.canvas.create_image(0, 0, anchor=tk.NW, image=self.tkimg)
 
-        self.record_video_frame(img)
-
     # -------------------- TCP --------------------
     def tcp_listener(self):
         while True:
@@ -460,12 +461,20 @@ class ZeDMDRenderer(tk.Tk):
             return
 
         self.set_recording_buttons(recording=True)
-        self.record_video_frame(self.get_display_image())
-        self.log(f'Started MP4 recording: {self.video_path}')
+        self.video_next_frame_time = time.monotonic()
+        self.log(f'Started MP4 recording at {self.video_fps} fps: {self.video_path}')
+        self.record_video_tick()
 
     def stop_video_recording(self):
         if self.video_writer is None:
             return
+
+        if self.video_after_id is not None:
+            try:
+                self.after_cancel(self.video_after_id)
+            except Exception:
+                pass
+            self.video_after_id = None
 
         video_path = self.video_path
         try:
@@ -475,7 +484,38 @@ class ZeDMDRenderer(tk.Tk):
             self.video_writer = None
             self.video_path = None
             self.video_frame_count = 0
+            self.video_next_frame_time = None
             self.set_recording_buttons(recording=False)
+
+    def record_video_tick(self):
+        if self.video_writer is None:
+            self.video_after_id = None
+            return
+
+        now = time.monotonic()
+        if self.video_next_frame_time is None:
+            self.video_next_frame_time = now
+
+        frame_interval = 1.0 / max(1, self.video_fps)
+        frames_due = 0
+        while self.video_next_frame_time <= now:
+            frames_due += 1
+            self.video_next_frame_time += frame_interval
+
+        if frames_due == 0:
+            delay_ms = max(1, int((self.video_next_frame_time - now) * 1000))
+            self.video_after_id = self.after(delay_ms, self.record_video_tick)
+            return
+
+        img = self.get_display_image()
+        for _ in range(frames_due):
+            self.record_video_frame(img)
+            if self.video_writer is None:
+                self.video_after_id = None
+                return
+
+        next_delay = max(1, int((self.video_next_frame_time - time.monotonic()) * 1000))
+        self.video_after_id = self.after(next_delay, self.record_video_tick)
 
     def record_video_frame(self, img):
         if self.video_writer is None:
