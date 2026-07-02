@@ -15,6 +15,7 @@ import tkinter as tk
 from tkinter import messagebox
 from PIL import Image, ImageTk
 import numpy as np
+import queue
 
 try:
     RESAMPLE_NEAREST = Image.Resampling.NEAREST
@@ -47,6 +48,17 @@ SCALE = 3
 
 ZEDMD_VERSION = "5.1.8"
 VPX_HANDSHAKE_RESPONSE = b"128|32|5.1.8|1|UDP|3333|5|1216|15|0|0|0|16|8|30|0|vidmd|0|0|58|0|0"
+
+# -------------------- Optimization: RGB565 LUT --------------------
+# Precomputed RGB565 -> RGB888 Look-Up Table (LUT).
+# Instead of doing bitwise math on every single pixel during live playback,
+# we calculate all 65,536 possible colors once at startup. 
+_RGB565_LUT = np.zeros((65536, 3), dtype=np.uint8)
+_idx = np.arange(65536, dtype=np.uint16)
+_r5, _g6, _b5 = (_idx >> 11) & 0x1F, (_idx >> 5) & 0x3F, _idx & 0x1F
+_RGB565_LUT[:, 0] = ((_r5 << 3) | (_r5 >> 2)).astype(np.uint8)
+_RGB565_LUT[:, 1] = ((_g6 << 2) | (_g6 >> 4)).astype(np.uint8)
+_RGB565_LUT[:, 2] = ((_b5 << 3) | (_b5 >> 2)).astype(np.uint8)
 
 
 class ZeDMDRenderer(tk.Tk):
@@ -89,6 +101,8 @@ class ZeDMDRenderer(tk.Tk):
         self.settings_port = settings_port
         self.bind_host = bind_host
         self.video_writer = None
+        self.video_queue = None
+        self.video_thread = None
         self.video_path = None
         self.video_frame_count = 0
         self.video_next_frame_time = None
@@ -139,6 +153,7 @@ class ZeDMDRenderer(tk.Tk):
         self.after(10, self.poll_udp)
 
         img = self.get_display_image()
+        self._last_display_image = img  # Cache the image for optimization
         self.tkimg = ImageTk.PhotoImage(img)
         self.image_id = self.canvas.create_image(0,0,anchor=tk.NW,image=self.tkimg)
 
@@ -291,14 +306,9 @@ class ZeDMDRenderer(tk.Tk):
         elif arr.size > ZONE_PIXELS:
             arr = arr[:ZONE_PIXELS]
 
-        arr = arr.reshape((ZONE_HEIGHT, ZONE_WIDTH))
-        r5 = (arr >> 11) & 0x1F
-        g6 = (arr >> 5) & 0x3F
-        b5 = arr & 0x1F
-        r = ((r5<<3)|(r5>>2)).astype(np.uint8)
-        g = ((g6<<2)|(g6>>4)).astype(np.uint8)
-        b = ((b5<<3)|(b5>>2)).astype(np.uint8)
-        rgb = np.stack([r,g,b], axis=2)
+        # Optimization: Use the precomputed LUT instead of doing shifting math.
+        # This takes the array of 16-bit integers, uses them as indexes to look up the 24-bit RGB array answers, and reshapes it to the 8x4 pixel zone dimensions.
+        rgb = _RGB565_LUT[arr].reshape((ZONE_HEIGHT, ZONE_WIDTH, 3))
         self.frame[y0:y1, x0:x1] = rgb
     
     
@@ -313,14 +323,21 @@ class ZeDMDRenderer(tk.Tk):
 
         # Apply luminosity scaling
         factor = self.luminosity.get() / 100.0
-        adjusted = np.clip(expanded.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+        if factor == 1.0:
+            adjusted = expanded
+        else:
+            adjusted = np.clip(expanded.astype(np.float32) * factor, 0, 255).astype(np.uint8)
 
         img_w = expanded_w * SCALE
         img_h = expanded_h * SCALE
         return Image.fromarray(adjusted, 'RGB').resize((img_w, img_h), RESAMPLE_NEAREST)
 
     def update_display(self):
-        img = self.get_display_image()
+        """Pushes the current visual state to the screen."""
+        # Optimization: Cache the output of get_display_image().
+        # Since this UI update might fire right before a video recording frame is needed, caching it prevents us from resizing the image twice for the exact same frame.
+        self._last_display_image = self.get_display_image()
+        img = self._last_display_image
 
         self.canvas.config(width=img.width, height=img.height)
         self.tkimg = ImageTk.PhotoImage(img)
@@ -339,7 +356,6 @@ class ZeDMDRenderer(tk.Tk):
             except OSError:
                 return
             self._tcp_connection_count += 1
-            self.log(f'TCP connection #{self._tcp_connection_count} from {addr[0]}:{addr[1]}')
             threading.Thread(target=self.handle_tcp_client, args=(conn,addr), daemon=True).start()
 
     def handle_tcp_client(self, conn, addr):
@@ -424,6 +440,25 @@ class ZeDMDRenderer(tk.Tk):
         Image.fromarray(self.frame, 'RGB').save('zedmd_capture_renderer.png')
         self.log('Saved zedmd_capture_renderer.png')
 
+    def _video_writer_loop(self):
+        """
+        Optimization: Background thread that writes video files.
+        Writing to MP4 via imageio blocks execution. If we do this on the main Tkinter thread,
+        the UI freezes and the UDP socket drops packets. By running it in a daemon thread,
+        the UI stays fast while the heavy compression happens silently in the background.
+        """
+        while True:
+            item = self.video_queue.get() # Waits for a frame to arrive from the main thread
+            if item is None:  # None is used as a signal to close the thread safely
+                break
+            try:
+                self.video_writer.append_data(item)
+                self.video_frame_count += 1
+                if self.video_frame_count == 1 or self.video_frame_count % 300 == 0:
+                    self.log(f'Wrote MP4 frame #{self.video_frame_count} to {self.video_path}')
+            except Exception as e:
+                self.log(f'MP4 write error: {e}')
+
     def start_video_recording(self):
         if self.video_writer is not None:
             self.log(f'MP4 recording is already running: {self.video_path}')
@@ -453,9 +488,17 @@ class ZeDMDRenderer(tk.Tk):
                 quality=8,
                 macro_block_size=1,
             )
+            # Create a queue that can hold 2 seconds worth of frames before getting full
+            self.video_queue = queue.Queue(maxsize=self.video_fps * 2) 
+            
+            # Spin up the background thread
+            self.video_thread = threading.Thread(target=self._video_writer_loop, daemon=True)
+            self.video_thread.start()
         except Exception as e:
             self.video_writer = None
             self.video_path = None
+            self.video_queue = None
+            self.video_thread = None
             self.log(f'Could not start MP4 recording: {e}')
             messagebox.showerror('MP4 recording unavailable', f'Could not start MP4 recording:\n\n{e}')
             return
@@ -477,12 +520,21 @@ class ZeDMDRenderer(tk.Tk):
             self.video_after_id = None
 
         video_path = self.video_path
+
+        # Send the sentinel 'None' value to tell the background thread to shut down
+        if self.video_queue is not None:
+            self.video_queue.put(None)
+        if self.video_thread is not None:
+            self.video_thread.join(timeout=5) # Wait for it to finish its remaining work
+
         try:
             self.video_writer.close()
             self.log(f'Saved MP4 recording: {video_path} ({self.video_frame_count} frames)')
         finally:
             self.video_writer = None
             self.video_path = None
+            self.video_queue = None
+            self.video_thread = None
             self.video_frame_count = 0
             self.video_next_frame_time = None
             self.set_recording_buttons(recording=False)
@@ -502,12 +554,28 @@ class ZeDMDRenderer(tk.Tk):
             frames_due += 1
             self.video_next_frame_time += frame_interval
 
+        # Optimization: Cap frame bursts.
+        # If the computer lags heavily (e.g. CPU spike), `frames_due` might jump to 60+. 
+        # Attempting to queue 60 frames instantly will freeze Tkinter and cause a death spiral.
+        # We cap it to a maximum of 1 second's worth of frames. 
+        original_frames_due = frames_due
+        frames_due = min(frames_due, self.video_fps)  
+        if frames_due < original_frames_due:
+            # Reset our internal clock so we don't try to catch up on the dropped backlog
+            self.video_next_frame_time = now  
+
         if frames_due == 0:
+            # We are ahead of schedule. Sleep until the next frame is due.
             delay_ms = max(1, int((self.video_next_frame_time - now) * 1000))
             self.video_after_id = self.after(delay_ms, self.record_video_tick)
             return
 
-        img = self.get_display_image()
+        # Fetch the cached display image instead of recalculating it
+        img = getattr(self, '_last_display_image', None)
+        if img is None:
+            img = self.get_display_image()
+            self._last_display_image = img
+
         for _ in range(frames_due):
             self.record_video_frame(img)
             if self.video_writer is None:
@@ -527,10 +595,15 @@ class ZeDMDRenderer(tk.Tk):
             pad_w = frame.shape[1] % 2
             if pad_h or pad_w:
                 frame = np.pad(frame, ((0, pad_h), (0, pad_w), (0, 0)), mode='constant')
-            self.video_writer.append_data(frame)
-            self.video_frame_count += 1
+
+            # put_nowait instantly drops the frame into the queue. 
+            # If the background thread is too slow and the queue is full, it throws queue.Full
+            self.video_queue.put_nowait(frame)
             if self.video_frame_count == 1 or self.video_frame_count % 300 == 0:
                 self.log(f'Wrote MP4 frame #{self.video_frame_count} to {self.video_path}')
+
+        except queue.Full:
+            self.log('Video queue full — dropping frame to keep up')
         except Exception as e:
             self.stop_video_recording()
             messagebox.showerror('MP4 recording stopped', f'Could not write MP4 frame:\n\n{e}')
