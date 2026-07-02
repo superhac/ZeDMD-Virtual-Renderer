@@ -313,7 +313,10 @@ class ZeDMDRenderer(tk.Tk):
 
         # Apply luminosity scaling
         factor = self.luminosity.get() / 100.0
-        adjusted = np.clip(expanded.astype(np.float32) * factor, 0, 255).astype(np.uint8)
+        if factor == 1.0:
+            adjusted = expanded
+        else:
+            adjusted = np.clip(expanded.astype(np.float32) * factor, 0, 255).astype(np.uint8)
 
         img_w = expanded_w * SCALE
         img_h = expanded_h * SCALE
